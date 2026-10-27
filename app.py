@@ -39,42 +39,49 @@ def init_db():
 
 class LogPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
-    name: str = Field(min_length=1, max_length=200)
-    generation: str | None = Field(default=None, max_length=80)
-    generation_raw: int | float | None = None
-    weight: str = Field(min_length=1, max_length=100)
-    rarity: str = Field(min_length=1, max_length=100)
-    zone: str | None = Field(default=None, max_length=200)
-    player_count: int | None = Field(default=None, ge=0, le=10000)
-    image_url: str | None = Field(default=None, max_length=2048)
-    join_url: str | None = Field(default=None, max_length=2048)
-    place_id: int | str | None = None
-    job_id: str = Field(min_length=1, max_length=200)
+    name: Any = Field(default="Unknown")
+    generation: Any = Field(default=None)
+    generation_raw: Any = Field(default=None)
+    weight: Any = Field(default="0")
+    rarity: Any = Field(default="Common")
+    zone: Any = Field(default=None)
+    player_count: Any = Field(default=None)
+    image_url: Any = Field(default=None)
+    join_url: Any = Field(default=None)
+    place_id: Any = Field(default=None)
+    job_id: Any = Field(default="test_job")
 
-    @field_validator("name", "weight", "rarity", "job_id")
+    @field_validator("name", "rarity", "job_id", "weight", "generation", mode="before")
     @classmethod
-    def nonblank(cls, v):
-        if not v.strip(): raise ValueError("Este campo no puede estar vacío")
-        return v.strip()
+    def to_string(cls, v):
+        if v is None: return ""
+        return str(v).strip()
 
-    @field_validator("image_url", "join_url")
+    @field_validator("zone", mode="before")
     @classmethod
-    def http_url(cls, v):
+    def to_string_optional(cls, v):
+        if v is None: return None
+        s = str(v).strip()
+        return s if s else None
+
+    @field_validator("player_count", mode="before")
+    @classmethod
+    def to_int(cls, v):
+        if v is None: return None
+        try: return int(v)
+        except (ValueError, TypeError): return None
+
+    @field_validator("image_url", "join_url", mode="before")
+    @classmethod
+    def safe_url(cls, v):
         if v is None or v == "": return None
-        p = urlparse(v)
+        s = str(v).strip()
+        p = urlparse(s)
         if p.scheme not in ("http", "https") or not p.netloc:
-            raise ValueError("La URL debe usar http o https")
-        return v
-
-    @field_validator("generation_raw")
-    @classmethod
-    def nonnegative_finite(cls, v):
-        if v is not None and (v < 0 or (isinstance(v, float) and (v != v or abs(v) == float("inf")))):
-            raise ValueError("generation_raw debe ser un número finito no negativo")
-        return v
+            return None
+        return s
 
 def make_key(d: dict[str, Any]) -> str:
-    # Se permiten Job IDs repetidos; solo se descarta la combinación exacta de 4 campos.
     raw = "\x1f".join(str(d.get(k, "")).strip().casefold() for k in ("job_id","name","weight","rarity"))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -187,6 +194,5 @@ async def stats(x_api_key: str|None=Header(default=None), authorization: str|Non
         a=c.execute("SELECT COUNT(*) n FROM logs WHERE expires_at>?",(now,)).fetchone()["n"]
         d=c.execute("SELECT COUNT(*) n FROM dedupe WHERE expires_at>?",(now,)).fetchone()["n"]
     return {"ok":True,"active_logs":a,"dedupe_keys":d,"ttl_seconds":LOG_TTL}
-
 
 HTML = '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lexy Hub · Live Logs</title><style>\n:root{color-scheme:dark;--bg:#080b12;--panel:#111827;--line:#253148;--text:#edf3ff;--muted:#9aa9c0;--accent:#60a5fa}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#14223a 0,var(--bg) 55%);font:14px/1.5 system-ui,Segoe UI,sans-serif;color:var(--text)}main{max-width:1120px;margin:auto;padding:24px 16px 50px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:20px}h1{font-size:24px;margin:0}.sub{color:var(--muted);margin-top:4px}.status{border:1px solid var(--line);border-radius:999px;padding:7px 11px;color:#b9f6ca;background:#0c2019}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.toolbar input{flex:1;min-width:180px}input,button{border:1px solid var(--line);border-radius:10px;background:#0c1220;color:var(--text);padding:10px 12px;font:inherit}button{cursor:pointer;background:#17345b;border-color:#28558c}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.card{background:linear-gradient(150deg,#141e30,#0e1420);border:1px solid var(--line);border-radius:16px;overflow:hidden}.hero{height:130px;background:#0a101b;display:flex;align-items:center;justify-content:center;overflow:hidden}.hero img{width:100%;height:100%;object-fit:cover}.body{padding:14px}.name{font-size:18px;font-weight:750;display:flex;justify-content:space-between;gap:8px}.rarity{font-size:11px;padding:4px 7px;border-radius:7px;background:#312453;color:#e2d5ff;white-space:nowrap;height:max-content}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.stat{background:#0b1220;border:1px solid #1d2a3e;padding:8px;border-radius:9px}.label{color:var(--muted);font-size:11px}.value{font-weight:650;overflow-wrap:anywhere}.foot{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:11px}.join{display:inline-block;text-decoration:none;color:#bfdbfe;border:1px solid #2a4e7b;padding:7px 10px;border-radius:8px;margin-top:10px}.empty{border:1px dashed var(--line);border-radius:14px;padding:40px 18px;text-align:center;color:var(--muted);grid-column:1/-1}.error{color:#fca5a5}</style></head><body><main><div class="top"><div><h1>Lexy Hub <span style="color:var(--accent)">Live Logs</span></h1><div class="sub">Eventos en vivo · expiración automática</div></div><div id="status" class="status">● Desconectado</div></div><div class="toolbar"><input id="key" type="password" placeholder="API Key (solo esta pestaña)"><button id="connect">Conectar</button><input id="filter" placeholder="Filtrar nombre, rareza, zona o Job ID"></div><div class="toolbar"><span class="sub" id="summary">0 logs activos</span><span class="sub" id="updated"></span></div><div id="grid" class="grid"><div class="empty">Introduce tu API Key y pulsa Conectar.</div></div></main><script>\nconst $=s=>document.querySelector(s),grid=$(\'#grid\'),status=$(\'#status\');let key=sessionStorage.getItem(\'lexy_api_key\')||\'\',timer=null;$(\'#key\').value=key;\nfunction esc(v){return String(v??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]))}\nfunction card(x){let img=x.image_url?`<img loading="lazy" src="${esc(x.image_url)}" alt="" onerror="this.remove()">`:\'\';let join=x.join_url&&/^https?:\\/\\//i.test(x.join_url)?`<a class="join" href="${esc(x.join_url)}" target="_blank" rel="noopener noreferrer">Abrir partida ↗</a>`:\'\';return `<article class="card"><div class="hero">${img}</div><div class="body"><div class="name"><span>${esc(x.name)}</span><span class="rarity">${esc(x.rarity)}</span></div><div class="stats"><div class="stat"><div class="label">Generación</div><div class="value">${esc(x.generation||x.generation_raw||\'—\')}</div></div><div class="stat"><div class="label">Peso</div><div class="value">${esc(x.weight)}</div></div><div class="stat"><div class="label">Zona</div><div class="value">${esc(x.zone||\'—\')}</div></div><div class="stat"><div class="label">Jugadores</div><div class="value">${esc(x.player_count??\'—\')}</div></div></div><div class="foot"><span>Job: ${esc((x.job_id||\'\').slice(0,18))}</span><span>${Number(x.expires_in||0).toFixed(1)}s</span></div>${join}</div></article>`}\nasync function poll(){if(!key)return;try{let r=await fetch(\'/logs?limit=200\',{headers:{\'X-API-Key\':key},cache:\'no-store\'});if(r.status===401){status.textContent=\'● API Key incorrecta\';status.className=\'status error\';return}if(!r.ok)throw Error(\'HTTP \'+r.status);let d=await r.json(),q=$(\'#filter\').value.toLowerCase();let items=(d.logs||[]).filter(x=>[x.name,x.rarity,x.zone,x.job_id].join(\' \').toLowerCase().includes(q));grid.innerHTML=items.length?items.map(card).join(\'\'):\'<div class="empty">No hay logs activos que coincidan.</div>\';$(\'#summary\').textContent=`${d.count} logs activos`;$ (\'#updated\').textContent=\'Actualizado \'+new Date().toLocaleTimeString();status.textContent=\'● Conectado\';status.className=\'status\'}catch(e){status.textContent=\'● Error de conexión\';status.className=\'status error\'}}\n$(\'#connect\').onclick=()=>{key=$(\'#key\').value.trim();sessionStorage.setItem(\'lexy_api_key\',key);if(timer)clearInterval(timer);poll();timer=setInterval(poll,400)};$(\'#filter\').addEventListener(\'input\',poll);if(key)$(\'#connect\').click();\n</script></body></html>'
