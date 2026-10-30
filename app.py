@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, json, logging, os, sqlite3, time
+import asyncio, hashlib, json, logging, os, re, sqlite3, time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 APP_NAME = "Lexy Hub Logs API"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DB_PATH = Path(os.getenv("DATABASE_PATH", "./data/logs.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LOG_TTL = max(1.0, min(float(os.getenv("LOG_TTL_SECONDS", "2")), 300.0))
@@ -17,6 +17,8 @@ DEDUP_TTL = max(LOG_TTL, min(float(os.getenv("DEDUP_TTL_SECONDS", "30")), 86400.
 API_KEY = os.getenv("API_KEY", "").strip()
 MAX_ACTIVE = max(100, min(int(os.getenv("MAX_ACTIVE_LOGS", "5000")), 100000))
 RATE_LIMIT = max(10, min(int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")), 10000))
+PRESENCE_TTL = max(10.0, min(float(os.getenv("PRESENCE_TTL_SECONDS", "30")), 600.0))
+ROBLOX_USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("LexyHubLogs")
 
@@ -35,7 +37,28 @@ def init_db():
         CREATE TABLE IF NOT EXISTS dedupe(dedupe_key TEXT PRIMARY KEY,expires_at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS dedupe_exp ON dedupe(expires_at);
         CREATE TABLE IF NOT EXISTS rates(client_key TEXT PRIMARY KEY,window_start REAL NOT NULL,count INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS presence(user TEXT PRIMARY KEY,last_seen REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS presence_seen ON presence(last_seen);
         """)
+
+class UserPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    user: str = Field(min_length=3, max_length=20)
+    action: str = Field(default="heartbeat")
+
+    @field_validator("user")
+    @classmethod
+    def valid_user(cls, v):
+        if not ROBLOX_USER_RE.match(v):
+            raise ValueError("user inválido")
+        return v
+
+    @field_validator("action")
+    @classmethod
+    def valid_action(cls, v):
+        if v not in ("heartbeat", "leave"):
+            raise ValueError("action inválida")
+        return v
 
 class LogPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
@@ -185,6 +208,39 @@ async def logs(request: Request, limit: int=Query(100,ge=1,le=500), x_api_key: s
         except json.JSONDecodeError: continue
         out.append({"id":r["id"],**data,"received_at":r["received_at"],"expires_at":r["expires_at"],"expires_in":max(0,round(r["expires_at"]-now,2))})
     return {"ok":True,"count":len(out),"ttl_seconds":LOG_TTL,"logs":out}
+
+@app.post("/senduser")
+async def send_user(payload: UserPayload, request: Request):
+    """heartbeat: registra o refresca al usuario. leave: lo borra al salir del juego.
+    Sin API key: el script del cliente lo llama directamente."""
+    now=time.time(); client=request.client.host if request.client else "unknown"
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rate(c,"presence:"+client,now)
+            if payload.action=="leave":
+                c.execute("DELETE FROM presence WHERE user=?",(payload.user,))
+            else:
+                c.execute("INSERT INTO presence(user,last_seen) VALUES(?,?) ON CONFLICT(user) DO UPDATE SET last_seen=excluded.last_seen",(payload.user,now))
+            c.execute("DELETE FROM presence WHERE last_seen<?",(now-PRESENCE_TTL,))
+            c.commit()
+        except HTTPException: c.rollback(); raise
+    return {"ok":True,"action":payload.action}
+
+@app.get("/users")
+async def users(request: Request):
+    """Lista de usuarios activos (heartbeat reciente). Sin API key."""
+    now=time.time(); client=request.client.host if request.client else "unknown"
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rate(c,"presence-read:"+client,now)
+            c.execute("DELETE FROM presence WHERE last_seen<?",(now-PRESENCE_TTL,))
+            rows=c.execute("SELECT user FROM presence ORDER BY user").fetchall()
+            c.commit()
+        except HTTPException: c.rollback(); raise
+    names=[r["user"] for r in rows]
+    return {"ok":True,"count":len(names),"users":names,"ttl_seconds":PRESENCE_TTL}
 
 @app.get("/stats")
 async def stats(x_api_key: str|None=Header(default=None), authorization: str|None=Header(default=None)):
