@@ -4,12 +4,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 APP_NAME = "Lexy Hub Logs API"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DB_PATH = Path(os.getenv("DATABASE_PATH", "./data/logs.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LOG_TTL = max(1.0, min(float(os.getenv("LOG_TTL_SECONDS", "2")), 300.0))
@@ -18,6 +19,9 @@ API_KEY = os.getenv("API_KEY", "").strip()
 MAX_ACTIVE = max(100, min(int(os.getenv("MAX_ACTIVE_LOGS", "5000")), 100000))
 RATE_LIMIT = max(10, min(int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")), 10000))
 PRESENCE_TTL = max(10.0, min(float(os.getenv("PRESENCE_TTL_SECONDS", "30")), 600.0))
+WEBHOOK_SPAWN_URL = os.getenv("WEBHOOK_SPAWN_URL", "https://discord.com/api/webhooks/1564772572908888114/07GkiIRIkg3LD9f5PhorOLPWtNyqrPzq_WxIAgOkx35KEXqSqXJ4dqmgS9m2D3pJDYFq").strip()
+WEBHOOK_ROBO_URL = os.getenv("WEBHOOK_ROBO_URL", "https://discord.com/api/webhooks/1564773472901791867/Xl50toxA5Z9kCyaIugT_0bAxX95UxYXq2QT0rA3slJbKwor5BltUCINd--qpXqNLSvzk").strip()
+TRANSPARENT_PNG = bytes([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 128, 0, 0, 0, 128, 8, 6, 0, 0, 0, 195, 62, 97, 203, 0, 0, 0, 86, 73, 68, 65, 84, 120, 218, 237, 193, 49, 1, 0, 0, 0, 194, 160, 245, 79, 109, 12, 31, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 224, 111, 0, 143, 0, 1, 138, 249, 130, 62, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130])
 ROBLOX_USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("LexyHubLogs")
@@ -190,6 +194,94 @@ async def receive(payload: LogPayload, request: Request, x_api_key: str|None=Hea
             c.rollback(); logger.exception("No se pudo guardar log")
             raise HTTPException(500,"No se pudo guardar el log")
     return {"ok":True,"duplicate":False,"message":"Log recibido","ttl_seconds":LOG_TTL}
+
+class WebhookPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    kind: str = Field(default="spawn")
+    discord: dict[str, Any]
+    attach_png: bool = False
+    log: LogPayload | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def valid_kind(cls, v):
+        if v not in ("spawn", "robo"):
+            raise ValueError("kind inválido")
+        return v
+
+async def post_discord(url: str, body: dict[str, Any], attach_png: bool) -> bool:
+    async with httpx.AsyncClient(timeout=15) as http:
+        for _ in range(4):
+            try:
+                if attach_png:
+                    res = await http.post(
+                        url,
+                        data={"payload_json": json.dumps(body, ensure_ascii=False)},
+                        files={"files[0]": ("transparent.png", TRANSPARENT_PNG, "image/png")},
+                    )
+                else:
+                    res = await http.post(url, json=body)
+            except httpx.HTTPError:
+                logger.exception("Fallo de red enviando webhook a Discord")
+                await asyncio.sleep(2)
+                continue
+            if 200 <= res.status_code < 300:
+                return True
+            if res.status_code == 429:
+                await asyncio.sleep(3)
+            elif res.status_code >= 500:
+                await asyncio.sleep(2)
+            else:
+                logger.warning("Discord respondió %s: %s", res.status_code, res.text[:200])
+                return False
+    return False
+
+@app.post("/sendwebhook")
+async def send_webhook(payload: WebhookPayload, request: Request, x_api_key: str|None=Header(default=None), authorization: str|None=Header(default=None)):
+    """spawn: deduplica (misma clave que /recibelogs), envía al webhook de spawns y guarda el log.
+    robo: envía al webhook de robos sin guardar log."""
+    auth(x_api_key,authorization)
+    if payload.kind == "spawn" and payload.log is None:
+        raise HTTPException(422, "Falta 'log' para kind=spawn")
+    url = WEBHOOK_SPAWN_URL if payload.kind == "spawn" else WEBHOOK_ROBO_URL
+    if not url.startswith("https://"):
+        raise HTTPException(500, "Webhook no configurado")
+    now=time.time(); client=request.client.host if request.client else "unknown"
+    key = make_key(payload.log.model_dump()) if payload.kind == "spawn" else None
+
+    # Reserva la clave de dedupe ANTES de enviar: evita enviar/guardar dos veces el mismo spawn
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            prune(c,now); rate(c,"webhook:"+client,now)
+            if key:
+                row=c.execute("SELECT expires_at FROM dedupe WHERE dedupe_key=?",(key,)).fetchone()
+                if row and row["expires_at"]>now:
+                    c.commit()
+                    return {"ok":True,"duplicate":True,"sent":False,"message":"Log duplicado ignorado"}
+                c.execute("INSERT INTO dedupe VALUES(?,?) ON CONFLICT(dedupe_key) DO UPDATE SET expires_at=excluded.expires_at",(key,now+DEDUP_TTL))
+            c.commit()
+        except HTTPException: c.rollback(); raise
+
+    sent = await post_discord(url, payload.discord, payload.attach_png)
+    if not sent:
+        if key:
+            with db() as c:
+                c.execute("DELETE FROM dedupe WHERE dedupe_key=?",(key,))
+        raise HTTPException(502, "Discord no aceptó el webhook")
+
+    if key:
+        now=time.time()
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                count=c.execute("SELECT COUNT(*) n FROM logs WHERE expires_at>?",(now,)).fetchone()["n"]
+                if count>=MAX_ACTIVE: c.execute("DELETE FROM logs WHERE id=(SELECT id FROM logs ORDER BY received_at LIMIT 1)")
+                c.execute("INSERT INTO logs(dedupe_key,payload_json,received_at,expires_at) VALUES(?,?,?,?)",(key,json.dumps(payload.log.model_dump(),ensure_ascii=False,separators=(",",":")),now,now+LOG_TTL))
+                c.commit()
+            except Exception:
+                c.rollback(); logger.exception("Webhook enviado pero no se pudo guardar el log")
+    return {"ok":True,"duplicate":False,"sent":True,"message":"Webhook enviado"}
 
 @app.get("/logs")
 async def logs(request: Request, limit: int=Query(100,ge=1,le=500), x_api_key: str|None=Header(default=None), authorization: str|None=Header(default=None)):
