@@ -15,6 +15,8 @@ DB_PATH = Path(os.getenv("DATABASE_PATH", "./data/logs.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LOG_TTL = max(1.0, min(float(os.getenv("LOG_TTL_SECONDS", "2")), 300.0))
 DEDUP_TTL = max(LOG_TTL, min(float(os.getenv("DEDUP_TTL_SECONDS", "30")), 86400.0))
+WEBHOOK_DEDUP_TTL = max(30.0, min(float(os.getenv("WEBHOOK_DEDUP_TTL_SECONDS", "1800")), 86400.0))
+ROBO_DEDUP_TTL = max(30.0, min(float(os.getenv("WEBHOOK_ROBO_DEDUP_TTL_SECONDS", "300")), 86400.0))
 API_KEY = os.getenv("API_KEY", "").strip()
 MAX_ACTIVE = max(100, min(int(os.getenv("MAX_ACTIVE_LOGS", "5000")), 100000))
 RATE_LIMIT = max(10, min(int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")), 10000))
@@ -201,6 +203,7 @@ class WebhookPayload(BaseModel):
     discord: dict[str, Any]
     attach_png: bool = False
     log: LogPayload | None = None
+    dedupe_key: str | None = Field(default=None, max_length=200)
 
     @field_validator("kind")
     @classmethod
@@ -238,18 +241,24 @@ async def post_discord(url: str, body: dict[str, Any], attach_png: bool) -> bool
 
 @app.post("/sendwebhook")
 async def send_webhook(payload: WebhookPayload, request: Request, x_api_key: str|None=Header(default=None), authorization: str|None=Header(default=None)):
-    """spawn: deduplica (misma clave que /recibelogs), envía al webhook de spawns y guarda el log.
-    robo: envía al webhook de robos sin guardar log."""
+    """Solo envía a Discord (no guarda logs; eso lo hace /recibelogs).
+    spawn: deduplica con clave propia 'wh:' para no repetir el mensaje en Discord.
+    robo: envía al webhook de robos; si trae dedupe_key (UserId:uid) también deduplica."""
     auth(x_api_key,authorization)
     if payload.kind == "spawn" and payload.log is None:
-        raise HTTPException(422, "Falta 'log' para kind=spawn")
+        raise HTTPException(422, "Falta 'log' para kind=spawn (se usa para deduplicar)")
     url = WEBHOOK_SPAWN_URL if payload.kind == "spawn" else WEBHOOK_ROBO_URL
     if not url.startswith("https://"):
         raise HTTPException(500, "Webhook no configurado")
     now=time.time(); client=request.client.host if request.client else "unknown"
-    key = make_key(payload.log.model_dump()) if payload.kind == "spawn" else None
+    key, ttl = None, WEBHOOK_DEDUP_TTL
+    if payload.kind == "spawn":
+        key = "wh:" + make_key(payload.log.model_dump())
+    elif payload.dedupe_key:
+        key = "rb:" + hashlib.sha256(payload.dedupe_key.encode()).hexdigest()
+        ttl = ROBO_DEDUP_TTL
 
-    # Reserva la clave de dedupe ANTES de enviar: evita enviar/guardar dos veces el mismo spawn
+    # Reserva la clave ANTES de enviar: dos requests iguales a la vez no envían dos veces
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         try:
@@ -258,10 +267,14 @@ async def send_webhook(payload: WebhookPayload, request: Request, x_api_key: str
                 row=c.execute("SELECT expires_at FROM dedupe WHERE dedupe_key=?",(key,)).fetchone()
                 if row and row["expires_at"]>now:
                     c.commit()
-                    return {"ok":True,"duplicate":True,"sent":False,"message":"Log duplicado ignorado"}
-                c.execute("INSERT INTO dedupe VALUES(?,?) ON CONFLICT(dedupe_key) DO UPDATE SET expires_at=excluded.expires_at",(key,now+DEDUP_TTL))
+                    logger.info("Webhook %s duplicado ignorado", payload.kind)
+                    return {"ok":True,"duplicate":True,"sent":False,"message":"Webhook duplicado ignorado"}
+                c.execute("INSERT INTO dedupe VALUES(?,?) ON CONFLICT(dedupe_key) DO UPDATE SET expires_at=excluded.expires_at",(key,now+ttl))
             c.commit()
         except HTTPException: c.rollback(); raise
+        except Exception:
+            c.rollback(); logger.exception("No se pudo reservar la clave de webhook")
+            raise HTTPException(500,"Error interno")
 
     sent = await post_discord(url, payload.discord, payload.attach_png)
     if not sent:
@@ -269,18 +282,6 @@ async def send_webhook(payload: WebhookPayload, request: Request, x_api_key: str
             with db() as c:
                 c.execute("DELETE FROM dedupe WHERE dedupe_key=?",(key,))
         raise HTTPException(502, "Discord no aceptó el webhook")
-
-    if key:
-        now=time.time()
-        with db() as c:
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                count=c.execute("SELECT COUNT(*) n FROM logs WHERE expires_at>?",(now,)).fetchone()["n"]
-                if count>=MAX_ACTIVE: c.execute("DELETE FROM logs WHERE id=(SELECT id FROM logs ORDER BY received_at LIMIT 1)")
-                c.execute("INSERT INTO logs(dedupe_key,payload_json,received_at,expires_at) VALUES(?,?,?,?)",(key,json.dumps(payload.log.model_dump(),ensure_ascii=False,separators=(",",":")),now,now+LOG_TTL))
-                c.commit()
-            except Exception:
-                c.rollback(); logger.exception("Webhook enviado pero no se pudo guardar el log")
     return {"ok":True,"duplicate":False,"sent":True,"message":"Webhook enviado"}
 
 @app.get("/logs")
